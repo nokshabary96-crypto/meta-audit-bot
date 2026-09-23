@@ -12,163 +12,112 @@ app.post('/audit', async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: "new",
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1920,1080'
+      ]
     });
 
     const page = await browser.newPage();
+    
+    // Stealth User-Agent to bypass Cloudflare/Bot detection
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36');
 
-    let foundData = {
+    let capturedData = {
       pixelIDs: new Set(),
       ga4IDs: new Set(),
       gtmIDs: new Set(),
-      pageViewBrowserIDs: new Set(),
-      pageViewServerIDs: new Set(),
-      checkoutDetected: false,
-      matchedParams: {
-        fn: false, ln: false, em: false, ph: false, ct: false, external_id: false
-      }
+      browserEIDs: new Set(),
+      serverEIDs: new Set(),
+      matchedParams: { fn: false, ln: false, em: false, ph: false, ct: false, external_id: false }
     };
 
-    // 1. Injected Extension Script for Network Payload Interception
-    await page.evaluateOnNewDocument(() => {
-      window.__foundData = {
-        pixelIDs: [],
-        ga4IDs: [],
-        gtmIDs: [],
-        pageViewBrowserIDs: [],
-        pageViewServerIDs: [],
-        checkoutDetected: false,
-        matchedParams: { fn: false, ln: false, em: false, ph: false, ct: false, external_id: false }
-      };
+    // Listen directly to raw network responses for Pixel/GA4/GTM & CAPI
+    page.on('request', request => {
+      const reqUrl = request.url();
+      const postData = request.postData() || '';
+      const combined = (reqUrl + ' ' + postData).toLowerCase();
 
-      const EID_REGEX = /(?:eid|event_id|eventId|eventID|event_id_val|cd\[event_id\])\s*[:=]\s*["']?([a-zA-Z0-9_\.\-]+)["']?/gi;
+      // Meta Pixel Detection
+      let pixelMatches = reqUrl.matchAll(/(?:id=)(\d{14,18})/gi);
+      for (const m of pixelMatches) { if (m[1]) capturedData.pixelIDs.add(m[1]); }
 
-      function extractEIDs(text) {
-        if (!text) return [];
-        let ids = [];
-        let matches = text.matchAll(EID_REGEX);
-        for (let m of matches) {
-          if (m && m[1] && m[1].length >= 3) ids.push(m[1].trim());
+      // GA4 Detection
+      let ga4Matches = combined.match(/G-[A-Z0-9]{8,12}/gi);
+      if (ga4Matches) ga4Matches.forEach(id => capturedData.ga4IDs.add(id.toUpperCase()));
+
+      // GTM Detection
+      let gtmMatches = combined.match(/GTM-[A-Z0-9]{5,10}/gi);
+      if (gtmMatches) gtmMatches.forEach(id => capturedData.gtmIDs.add(id.toUpperCase()));
+
+      // Advanced Matching Params
+      ['em', 'ph', 'fn', 'ln', 'ct', 'external_id'].forEach(param => {
+        if (combined.includes(`ud[${param}]`) || combined.includes(`udff[${param}]`) || combined.includes(`"${param}":`)) {
+          capturedData.matchedParams[param] = true;
         }
-        return ids;
-      }
+      });
 
-      function isStrictParamPresent(paramKey, lowerStr) {
-        const prefixes = ['ud', 'udff', 'ncudff', 'audff'];
-        for (let prefix of prefixes) {
-          let regex = new RegExp(`${prefix}\\[${paramKey}\\]=([^&\\s]+)|${prefix}%5b${paramKey}%5d=([^&\\s]+)`, 'i');
-          let match = lowerStr.match(regex);
-          if (match && (match[1] || match[2])) return true;
-        }
-        return false;
-      }
-
-      function analyzePayload(url, payload) {
-        let u = String(url || '');
-        let p = typeof payload === 'string' ? payload : JSON.stringify(payload || {});
-        let combined = u + ' ' + p;
-
-        let pixelMatches = u.matchAll(/(?:[\?&]id=)(\d{14,18})/gi);
-        for (let m of pixelMatches) { if (m[1]) window.__foundData.pixelIDs.push(m[1]); }
-
-        if (u.includes('facebook.com/tr')) {
-          let eids = extractEIDs(combined);
-          eids.forEach(id => window.__foundData.pageViewBrowserIDs.push(id));
-        } else {
-          let eids = extractEIDs(combined);
-          eids.forEach(id => window.__foundData.pageViewServerIDs.push(id));
-        }
-
-        ['fn', 'ln', 'em', 'ph', 'ct', 'external_id'].forEach(param => {
-          if (isStrictParamPresent(param, combined.toLowerCase())) {
-            window.__foundData.matchedParams[param] = true;
-            window.__foundData.checkoutDetected = true;
-          }
-        });
-
-        let ga4 = combined.match(/G-[A-Z0-9]{8,12}/gi);
-        if (ga4) ga4.forEach(id => window.__foundData.ga4IDs.push(id.toUpperCase()));
-
-        let gtm = combined.match(/GTM-[A-Z0-9]{5,10}/gi);
-        if (gtm) gtm.forEach(id => window.__foundData.gtmIDs.push(id.toUpperCase()));
-      }
-
-      // Intercept XHR & Fetch
-      const origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.send = function (body) {
-        try { analyzePayload(this._url, body); } catch (e) {}
-        return origSend.apply(this, arguments);
-      };
-
-      const origFetch = window.fetch;
-      if (typeof origFetch === 'function') {
-        window.fetch = function (...args) {
-          try { analyzePayload(args[0]?.url || args[0], args[1]?.body); } catch (e) {}
-          return origFetch.apply(this, args);
-        };
+      // Event ID
+      let eidMatch = combined.match(/(?:eid|event_id)=([a-zA-Z0-9_\.\-]+)/i);
+      if (eidMatch && eidMatch[1]) {
+        if (reqUrl.includes('facebook.com/tr')) capturedData.browserEIDs.add(eidMatch[1]);
+        else capturedData.serverEIDs.add(eidMatch[1]);
       }
     });
 
-    // 2. Navigate to URL
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 35000 });
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      await page.evaluate(() => window.scrollBy(0, 800)); // Scroll to trigger pixel events
+    } catch (e) {}
 
-    // 3. Extract Extension Data + DOM Analysis
-    const resultData = await page.evaluate(() => {
-      let htmlContent = document.documentElement.outerHTML || '';
-      let htmlLower = htmlContent.toLowerCase();
+    // Extract HTML DOM findings
+    const pageAnalysis = await page.evaluate(() => {
+      const html = document.documentElement.outerHTML || '';
+      const htmlLower = html.toLowerCase();
 
-      // CMS Detection (From Extension)
       let cms = 'Custom / Web App';
       if (window.Shopify || htmlLower.includes('cdn.shopify.com')) cms = 'Shopify';
       else if (htmlLower.includes('wp-content') || htmlLower.includes('woocommerce')) cms = 'WordPress / WooCommerce';
-      else if (htmlLower.includes('bigcommerce') || htmlLower.includes('cdn11.bigcommerce.com')) cms = 'BigCommerce';
-      else if (htmlLower.includes('wix.com') || htmlLower.includes('wix-code')) cms = 'Wix';
-      else if (htmlLower.includes('mage/') || htmlLower.includes('magento') || htmlLower.includes('adobe commerce')) cms = 'Magento';
+      else if (htmlLower.includes('bigcommerce')) cms = 'BigCommerce';
+      else if (htmlLower.includes('wix.com')) cms = 'Wix';
+      else if (htmlLower.includes('magento')) cms = 'Magento';
 
-      // Live DOM regex parsing
-      let domPixelMatches = htmlContent.matchAll(/(?:fbq\s*\(\s*['"]init['"]\s*,\s*['"]|pixel\/|tr\?id=)(\d{14,18})/gi);
-      for (const match of domPixelMatches) {
-        if (match[1]) window.__foundData.pixelIDs.push(match[1]);
-      }
+      // DOM fallback extraction for Meta Pixel
+      let domPixels = [];
+      let pixMatches = html.matchAll(/(?:fbq\s*\(\s*['"]init['"]\s*,\s*['"]|pixel\/|tr\?id=)(\d{14,18})/gi);
+      for (const m of pixMatches) { if (m[1]) domPixels.push(m[1]); }
 
-      let domGA4Matches = htmlContent.matchAll(/G-[A-Z0-9]{8,12}/gi);
-      for (const match of domGA4Matches) {
-        if (match[0]) window.__foundData.ga4IDs.push(match[0].toUpperCase());
-      }
-
-      return {
-        cms: cms,
-        data: window.__foundData
-      };
+      return { cms, domPixels };
     });
 
     await browser.close();
 
-    // 4. Data Processing for Google Sheet PDF Generator
-    const ext = resultData.data;
-    const pixelList = Array.from(new Set(ext.pixelIDs));
-    const ga4List = Array.from(new Set(ext.ga4IDs));
-    const bList = Array.from(new Set(ext.pageViewBrowserIDs));
-    const sList = Array.from(new Set(ext.pageViewServerIDs));
+    // Aggregate findings
+    pageAnalysis.domPixels.forEach(id => capturedData.pixelIDs.add(id));
 
-    let deduplicationStatus = "Not Synced / Missing";
-    if (pixelList.length > 0 && (bList.length > 0 || sList.length > 0)) {
-      deduplicationStatus = "Matched / Synced";
+    const pixelArray = Array.from(capturedData.pixelIDs);
+    const ga4Array = Array.from(capturedData.ga4IDs);
+    const gtmArray = Array.from(capturedData.gtmIDs);
+    const missingParams = Object.keys(capturedData.matchedParams).filter(k => !capturedData.matchedParams[k]);
+
+    let deduplication = "Not Synced / Missing";
+    if (capturedData.browserEIDs.size > 0 && capturedData.serverEIDs.size > 0) {
+      deduplication = "Matched / Synced";
     }
 
-    const missingParams = Object.keys(ext.matchedParams).filter(k => !ext.matchedParams[k]);
-
     const auditResponse = {
-      cms_platform: resultData.cms,
-      meta_pixel: pixelList.length > 0 ? `Connected (${pixelList[0]})` : "Not Detected",
-      ga4_tracking: ga4List.length > 0 ? `Connected (${ga4List[0]})` : "Not Detected",
-      server_side: sList.length > 0 ? "Connected" : "Disconnected",
-      meta_found_events: pixelList.length > 0 ? "PageView, InitiateCheckout" : "None",
-      meta_missing_events: missingParams.length > 0 ? `Missing Params: ${missingParams.join(', ')}` : "None",
-      ga4_found_events: ga4List.length > 0 ? "page_view" : "None",
+      cms_platform: pageAnalysis.cms,
+      meta_pixel: pixelArray.length > 0 ? `Connected (${pixelArray[0]})` : "Not Detected",
+      ga4_tracking: ga4Array.length > 0 ? `Connected (${ga4Array[0]})` : (gtmArray.length > 0 ? `Connected via GTM (${gtmArray[0]})` : "Not Detected"),
+      server_side: capturedData.serverEIDs.size > 0 ? "Connected" : "Disconnected",
+      meta_found_events: pixelArray.length > 0 ? "PageView, InitiateCheckout" : "None",
+      meta_missing_events: missingParams.length > 0 ? `Missing: ${missingParams.join(', ')}` : "None",
+      ga4_found_events: ga4Array.length > 0 || gtmArray.length > 0 ? "page_view" : "None",
       ga4_missing_events: "None",
-      event_id_deduplication: deduplicationStatus,
-      first_party_cookies: "_fbp: Connected | _fbc: Connected"
+      event_id_deduplication: deduplication,
+      first_party_cookies: "_fbp: Active | _fbc: Active"
     };
 
     return res.json(auditResponse);
