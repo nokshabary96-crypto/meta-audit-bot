@@ -4,7 +4,8 @@ const puppeteer = require('puppeteer');
 const app = express();
 app.use(express.json());
 
-app.post('/auto-audit', async (req, res) => {
+// 🔴 Route-ti '/auto-audit' theke change kore '/audit' kora holo jate Google Sheet-er sathe match kore
+app.post('/audit', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
@@ -89,5 +90,5 @@ app.post('/auto-audit', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Audit Bot running on port ${PORT}`));
