@@ -12,17 +12,10 @@ app.post('/audit', async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: "new",
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1920,1080'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
     });
 
     const page = await browser.newPage();
-    
-    // Stealth User-Agent to bypass Cloudflare/Bot detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36');
 
     let capturedData = {
@@ -34,32 +27,27 @@ app.post('/audit', async (req, res) => {
       matchedParams: { fn: false, ln: false, em: false, ph: false, ct: false, external_id: false }
     };
 
-    // Listen directly to raw network responses for Pixel/GA4/GTM & CAPI
+    // Network Request Interception
     page.on('request', request => {
       const reqUrl = request.url();
       const postData = request.postData() || '';
       const combined = (reqUrl + ' ' + postData).toLowerCase();
 
-      // Meta Pixel Detection
       let pixelMatches = reqUrl.matchAll(/(?:id=)(\d{14,18})/gi);
       for (const m of pixelMatches) { if (m[1]) capturedData.pixelIDs.add(m[1]); }
 
-      // GA4 Detection
       let ga4Matches = combined.match(/G-[A-Z0-9]{8,12}/gi);
       if (ga4Matches) ga4Matches.forEach(id => capturedData.ga4IDs.add(id.toUpperCase()));
 
-      // GTM Detection
       let gtmMatches = combined.match(/GTM-[A-Z0-9]{5,10}/gi);
       if (gtmMatches) gtmMatches.forEach(id => capturedData.gtmIDs.add(id.toUpperCase()));
 
-      // Advanced Matching Params
       ['em', 'ph', 'fn', 'ln', 'ct', 'external_id'].forEach(param => {
         if (combined.includes(`ud[${param}]`) || combined.includes(`udff[${param}]`) || combined.includes(`"${param}":`)) {
           capturedData.matchedParams[param] = true;
         }
       });
 
-      // Event ID
       let eidMatch = combined.match(/(?:eid|event_id)=([a-zA-Z0-9_\.\-]+)/i);
       if (eidMatch && eidMatch[1]) {
         if (reqUrl.includes('facebook.com/tr')) capturedData.browserEIDs.add(eidMatch[1]);
@@ -69,7 +57,7 @@ app.post('/audit', async (req, res) => {
 
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-      await page.evaluate(() => window.scrollBy(0, 800)); // Scroll to trigger pixel events
+      await page.evaluate(() => window.scrollBy(0, 1000));
     } catch (e) {}
 
     // Extract HTML DOM findings
@@ -84,7 +72,6 @@ app.post('/audit', async (req, res) => {
       else if (htmlLower.includes('wix.com')) cms = 'Wix';
       else if (htmlLower.includes('magento')) cms = 'Magento';
 
-      // DOM fallback extraction for Meta Pixel
       let domPixels = [];
       let pixMatches = html.matchAll(/(?:fbq\s*\(\s*['"]init['"]\s*,\s*['"]|pixel\/|tr\?id=)(\d{14,18})/gi);
       for (const m of pixMatches) { if (m[1]) domPixels.push(m[1]); }
@@ -94,12 +81,11 @@ app.post('/audit', async (req, res) => {
 
     await browser.close();
 
-    // Aggregate findings
     pageAnalysis.domPixels.forEach(id => capturedData.pixelIDs.add(id));
 
-    const pixelArray = Array.from(capturedData.pixelIDs);
-    const ga4Array = Array.from(capturedData.ga4IDs);
-    const gtmArray = Array.from(capturedData.gtmIDs);
+    const pixelList = Array.from(capturedData.pixelIDs);
+    const ga4List = Array.from(capturedData.ga4IDs);
+    const gtmList = Array.from(capturedData.gtmIDs);
     const missingParams = Object.keys(capturedData.matchedParams).filter(k => !capturedData.matchedParams[k]);
 
     let deduplication = "Not Synced / Missing";
@@ -109,12 +95,12 @@ app.post('/audit', async (req, res) => {
 
     const auditResponse = {
       cms_platform: pageAnalysis.cms,
-      meta_pixel: pixelArray.length > 0 ? `Connected (${pixelArray[0]})` : "Not Detected",
-      ga4_tracking: ga4Array.length > 0 ? `Connected (${ga4Array[0]})` : (gtmArray.length > 0 ? `Connected via GTM (${gtmArray[0]})` : "Not Detected"),
+      meta_pixel: pixelList.length > 0 ? `Connected (${pixelList[0]})` : "Not Detected",
+      ga4_tracking: ga4List.length > 0 ? `Connected (${ga4List[0]})` : (gtmList.length > 0 ? `Connected via GTM (${gtmList[0]})` : "Not Detected"),
       server_side: capturedData.serverEIDs.size > 0 ? "Connected" : "Disconnected",
-      meta_found_events: pixelArray.length > 0 ? "PageView, InitiateCheckout" : "None",
+      meta_found_events: pixelList.length > 0 ? "PageView, InitiateCheckout" : "None",
       meta_missing_events: missingParams.length > 0 ? `Missing: ${missingParams.join(', ')}` : "None",
-      ga4_found_events: ga4Array.length > 0 || gtmArray.length > 0 ? "page_view" : "None",
+      ga4_found_events: ga4List.length > 0 || gtmList.length > 0 ? "page_view" : "None",
       ga4_missing_events: "None",
       event_id_deduplication: deduplication,
       first_party_cookies: "_fbp: Active | _fbc: Active"
